@@ -27,8 +27,13 @@ pub(crate) use decompress_safe as decompress;
 #[cfg(not(feature = "safe-decode"))]
 pub(crate) mod decompress;
 
+#[cfg(not(feature = "safe-decode"))]
+pub(crate) mod decompress_scattered;
+
 pub use compress::*;
 pub use decompress::*;
+#[cfg(not(feature = "safe-decode"))]
+pub use decompress_scattered::decompress_scattered;
 
 use core::{error::Error, fmt};
 

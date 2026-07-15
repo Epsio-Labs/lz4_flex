@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 
 /// Copies data to output_ptr by self-referential copy from start and match_length
 #[inline]
-unsafe fn duplicate(
+pub(super) unsafe fn duplicate(
     output_ptr: &mut *mut u8,
     output_end: *mut u8,
     start: *const u8,
@@ -54,7 +54,7 @@ fn wild_copy_from_src_16(mut source: *const u8, mut dst_ptr: *mut u8, num_items:
 /// Copy function, if the data start + match_length overlaps into output_ptr
 #[inline]
 #[cfg_attr(feature = "nightly", optimize(size))] // to avoid loop unrolling
-unsafe fn duplicate_overlapping(
+pub(super) unsafe fn duplicate_overlapping(
     output_ptr: &mut *mut u8,
     mut start: *const u8,
     match_length: usize,
@@ -82,7 +82,7 @@ unsafe fn duplicate_overlapping(
 }
 
 #[inline]
-unsafe fn copy_from_dict(
+pub(super) unsafe fn copy_from_dict(
     output_base: *mut u8,
     output_ptr: &mut *mut u8,
     ext_dict: &[u8],
@@ -158,7 +158,7 @@ pub(super) fn read_integer_ptr(
 
 /// Read the match offset as a little-endian 16-bit integer from the input stream.
 #[inline]
-fn read_match_offset(input_ptr: &mut *const u8) -> Result<u16, DecompressError> {
+pub(super) fn read_match_offset(input_ptr: &mut *const u8) -> Result<u16, DecompressError> {
     let mut num: u16 = 0;
     unsafe {
         core::ptr::copy_nonoverlapping(*input_ptr, &mut num as *mut u16 as *mut u8, 2);
@@ -189,7 +189,7 @@ fn check_token() {
 /// bits) if the literal length and match_length are both below 15, we don't need to read additional
 /// data, so the token does fit the metadata in a single u8.
 #[inline]
-fn does_token_fit(token: u8) -> bool {
+pub(super) fn does_token_fit(token: u8) -> bool {
     !((token & FIT_TOKEN_MASK_LITERAL) == FIT_TOKEN_MASK_LITERAL
         || (token & FIT_TOKEN_MASK_MATCH) == FIT_TOKEN_MASK_MATCH)
 }
