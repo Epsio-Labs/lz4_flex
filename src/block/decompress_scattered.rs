@@ -84,24 +84,29 @@ pub fn decompress_scattered(
         let last_input = next_nonempty(input, cur_frag + 1).is_none();
         let (finished, rest) = output.split_at_mut(buf_idx);
         let history: usize = finished.iter().map(|b| b.len()).sum();
-        let dict = build_dict(finished, &mut window_scratch, history);
 
-        // Specialize away the dict branches when there is no history, the
-        // same way the stock decoder does with USE_DICT.
-        let exit = if dict.is_empty() {
+        // Specialize away the dict branches whenever no match can reach the
+        // history, the same way the stock decoder does with USE_DICT. Only a
+        // sequence starting within the first WINDOW_SIZE bytes of a buffer
+        // can back-reference past its start (offsets are 16-bit), so the
+        // dict-aware variant decodes at most that prefix, through a clipped
+        // view of the buffer; everything past it runs dict-free.
+        let exit = if history == 0 || out_pos >= WINDOW_SIZE {
             decompress_fragment::<false>(
                 input[cur_frag],
                 &mut in_pos,
                 rest[0],
                 &mut out_pos,
-                dict,
+                &[],
                 last_input,
             )?
         } else {
+            let dict = build_dict(finished, &mut window_scratch, history);
+            let clip = rest[0].len().min(WINDOW_SIZE);
             decompress_fragment::<true>(
                 input[cur_frag],
                 &mut in_pos,
-                rest[0],
+                &mut rest[0][..clip],
                 &mut out_pos,
                 dict,
                 last_input,
@@ -110,9 +115,11 @@ pub fn decompress_scattered(
         match exit {
             FragmentExit::BlockEnd => return Ok(history + out_pos),
             FragmentExit::Boundary => {
-                // A clean stop on a fragment or buffer edge: the loop-top
-                // normalization advances past it.
+                // A clean stop on a fragment edge, a buffer edge, or the
+                // dict-phase clip (which the phase pick above advances past):
+                // just re-enter.
                 if in_pos == input[cur_frag].len()
+                    || out_pos == WINDOW_SIZE
                     || (out_pos == rest[0].len() && buf_idx + 1 < output.len())
                 {
                     continue;
@@ -396,22 +403,6 @@ fn decompress_fragment<const USE_DICT: bool>(
                 return Ok($exit);
             }};
         }
-        macro_rules! boundary {
-            () => {
-                exit_at!(seq_input_ptr, seq_output_ptr, FragmentExit::Boundary)
-            };
-        }
-        // A mid-sequence shortage of *input* is a buffer edge unless this is
-        // the last fragment, where it means the block is truncated.
-        macro_rules! boundary_or_err {
-            ($err:expr) => {{
-                if last_input {
-                    return Err($err);
-                }
-                boundary!();
-            }};
-        }
-
         // In-bounds: the loop is only (re)entered with at least one unread
         // input byte.
         let token = unsafe { input_ptr.read() };
@@ -465,6 +456,21 @@ fn decompress_fragment<const USE_DICT: bool>(
 
         // Careful path: exact bounds checks; every shortage that the next
         // fragment or buffer could relieve becomes a Boundary exit.
+        macro_rules! boundary {
+            () => {
+                exit_at!(seq_input_ptr, seq_output_ptr, FragmentExit::Boundary)
+            };
+        }
+        // A mid-sequence shortage of *input* is a buffer edge unless this is
+        // the last fragment, where it means the block is truncated.
+        macro_rules! boundary_or_err {
+            ($err:expr) => {{
+                if last_input {
+                    return Err($err);
+                }
+                boundary!();
+            }};
+        }
         let mut literal_length = (token >> 4) as usize;
         if literal_length != 0 {
             if literal_length == 15 {
