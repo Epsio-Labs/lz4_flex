@@ -616,6 +616,31 @@ mod tests {
             .collect()
     }
 
+    /// Incompressible input compresses to a single giant literal run whose
+    /// length rides in a multi-KiB tail of 255-bytes, exercising the
+    /// word-at-a-time integer reader on both decode paths.
+    #[test]
+    fn incompressible_long_length_extensions() {
+        let mut state = 0x853C49E6748FEA9Bu64;
+        let payload: Vec<u8> = (0..2 * 1024 * 1024)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (state >> 33) as u8
+            })
+            .collect();
+        let compressed = crate::block::compress(&payload);
+
+        let contiguous = run(&compressed, &[], &[payload.len()]);
+        let scattered = run(
+            &compressed,
+            &[compressed.len() / 3],
+            &[payload.len() / 2, payload.len() - payload.len() / 2],
+        );
+
+        assert_eq!(contiguous, payload);
+        assert_eq!(scattered, payload);
+    }
+
     #[test]
     fn contiguous_matches_stock_decoder() {
         let payload = payload_200k();

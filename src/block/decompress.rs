@@ -127,21 +127,38 @@ pub(super) fn read_integer_ptr(
     input_ptr: &mut *const u8,
     _input_ptr_end: *const u8,
 ) -> Result<usize, DecompressError> {
-    // We start at zero and count upwards.
-    let mut n: usize = 0;
-    // If this byte takes value 255 (the maximum value it can take), another byte is read
-    // and added to the sum. This repeats until a byte lower than 255 is read.
-    loop {
-        // We add the next byte until we get a byte which we add to the counting variable.
+    // Consume the run of 255-bytes a word at a time: the encoding spends one
+    // 255-byte per 255 counted, so e.g. an incompressible input stored as a
+    // single literal run carries ~4 KiB of 255-bytes per MiB, and reading
+    // those one by one dominates that decode.
+    let start = *input_ptr;
+    let mut ptr = start;
+    while (_input_ptr_end as usize).wrapping_sub(ptr as usize) >= 8 {
+        let word = u64::from_le(unsafe { (ptr as *const u64).read_unaligned() });
+        if word == u64::MAX {
+            ptr = unsafe { ptr.add(8) };
+            continue;
+        }
+        // The first non-255 byte terminates the integer, adding itself.
+        let run = ((!word).trailing_zeros() / 8) as usize;
+        ptr = unsafe { ptr.add(run) };
+        let last = unsafe { ptr.read() };
+        *input_ptr = unsafe { ptr.add(1) };
+        return Ok((ptr as usize - start as usize) * 255 + last as usize);
+    }
 
+    // Fewer than 8 bytes remain: finish byte by byte with exact bounds checks.
+    let mut n: usize = (ptr as usize - start as usize) * 255;
+    loop {
         // could be skipped with unchecked-decode
         {
-            if *input_ptr >= _input_ptr_end {
+            if ptr >= _input_ptr_end {
+                *input_ptr = ptr;
                 return Err(DecompressError::ExpectedAnotherByte);
             }
         }
-        let extra = unsafe { input_ptr.read() };
-        *input_ptr = unsafe { input_ptr.add(1) };
+        let extra = unsafe { ptr.read() };
+        ptr = unsafe { ptr.add(1) };
         n += extra as usize;
 
         // We continue if we got 255, break otherwise.
@@ -153,6 +170,7 @@ pub(super) fn read_integer_ptr(
     // 255, 255, 255, 8
     // 111, 111, 111, 101
 
+    *input_ptr = ptr;
     Ok(n)
 }
 
