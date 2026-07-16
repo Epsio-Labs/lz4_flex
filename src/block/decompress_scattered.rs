@@ -189,14 +189,14 @@ fn build_dict<'a>(
     scratch
 }
 
-/// Byte-wise cursor over the scattered input, advancing across fragments.
+/// Cursor over the scattered input, advancing across fragments.
 struct ScatteredReader<'a> {
     input: &'a [&'a [u8]],
     frag_idx: &'a mut Option<usize>,
     in_pos: &'a mut usize,
 }
 
-impl ScatteredReader<'_> {
+impl<'a> ScatteredReader<'a> {
     fn read_byte(&mut self) -> Result<u8, DecompressError> {
         loop {
             let Some(i) = *self.frag_idx else {
@@ -206,6 +206,24 @@ impl ScatteredReader<'_> {
                 let byte = self.input[i][*self.in_pos];
                 *self.in_pos += 1;
                 return Ok(byte);
+            }
+            *self.frag_idx = next_nonempty(self.input, i + 1);
+            *self.in_pos = 0;
+        }
+    }
+
+    /// The longest contiguous run available at the cursor, up to `max` bytes,
+    /// consumed. Never empty: exhausted input errors instead.
+    fn read_chunk(&mut self, max: usize) -> Result<&'a [u8], DecompressError> {
+        loop {
+            let Some(i) = *self.frag_idx else {
+                return Err(DecompressError::ExpectedAnotherByte);
+            };
+            if *self.in_pos < self.input[i].len() {
+                let run = &self.input[i][*self.in_pos..];
+                let take = run.len().min(max);
+                *self.in_pos += take;
+                return Ok(&run[..take]);
             }
             *self.frag_idx = next_nonempty(self.input, i + 1);
             *self.in_pos = 0;
@@ -244,21 +262,75 @@ struct ScatteredWriter<'a, 'b> {
 }
 
 impl ScatteredWriter<'_, '_> {
-    fn write_byte(&mut self, byte: u8) -> Result<(), DecompressError> {
-        while *self.buf_idx < self.output.len() && *self.out_pos == self.output[*self.buf_idx].len()
-        {
-            *self.buf_idx += 1;
-            *self.out_pos = 0;
+    fn overflow(&self) -> DecompressError {
+        let capacity: usize = self.output.iter().map(|b| b.len()).sum();
+        DecompressError::OutputTooSmall {
+            expected: capacity + 1,
+            actual: capacity,
         }
-        if *self.buf_idx >= self.output.len() {
-            let capacity: usize = self.output.iter().map(|b| b.len()).sum();
-            return Err(DecompressError::OutputTooSmall {
-                expected: capacity + 1,
-                actual: capacity,
-            });
+    }
+
+    /// Copy `data` to the cursor, spanning buffer edges chunk by chunk.
+    fn write_slice(&mut self, mut data: &[u8]) -> Result<(), DecompressError> {
+        while !data.is_empty() {
+            while *self.buf_idx < self.output.len()
+                && *self.out_pos == self.output[*self.buf_idx].len()
+            {
+                *self.buf_idx += 1;
+                *self.out_pos = 0;
+            }
+            if *self.buf_idx >= self.output.len() {
+                return Err(self.overflow());
+            }
+            let dst = &mut self.output[*self.buf_idx][*self.out_pos..];
+            let take = dst.len().min(data.len());
+            dst[..take].copy_from_slice(&data[..take]);
+            *self.out_pos += take;
+            data = &data[take..];
         }
-        self.output[*self.buf_idx][*self.out_pos] = byte;
-        *self.out_pos += 1;
+        Ok(())
+    }
+
+    /// Copy `len` already-written bytes starting `offset` back from the cursor
+    /// onto the cursor, replicating forward when the ranges overlap
+    /// (`offset < len`), in the largest chunks the buffer layout and the
+    /// replication period allow.
+    fn copy_back_reference(&mut self, offset: usize, len: usize) -> Result<(), DecompressError> {
+        let mut remaining = len;
+        while remaining > 0 {
+            while *self.buf_idx < self.output.len()
+                && *self.out_pos == self.output[*self.buf_idx].len()
+            {
+                *self.buf_idx += 1;
+                *self.out_pos = 0;
+            }
+            if *self.buf_idx >= self.output.len() {
+                return Err(self.overflow());
+            }
+            // Locate the source position, `offset` back from the cursor.
+            let mut src_pos = self.total_written() - offset;
+            let mut src_buf = 0;
+            while src_pos >= self.output[src_buf].len() {
+                src_pos -= self.output[src_buf].len();
+                src_buf += 1;
+            }
+            // Capping a chunk at `offset` keeps its source wholly behind its
+            // destination, which is what makes chunked copies replicate the
+            // same bytes the byte-wise loop would.
+            let take = remaining
+                .min(offset)
+                .min(self.output[src_buf].len() - src_pos)
+                .min(self.output[*self.buf_idx].len() - *self.out_pos);
+            if src_buf == *self.buf_idx {
+                self.output[src_buf].copy_within(src_pos..src_pos + take, *self.out_pos);
+            } else {
+                let (before, from_dst) = self.output.split_at_mut(*self.buf_idx);
+                from_dst[0][*self.out_pos..*self.out_pos + take]
+                    .copy_from_slice(&before[src_buf][src_pos..src_pos + take]);
+            }
+            *self.out_pos += take;
+            remaining -= take;
+        }
         Ok(())
     }
 
@@ -269,21 +341,11 @@ impl ScatteredWriter<'_, '_> {
             .sum::<usize>()
             + *self.out_pos
     }
-
-    /// The already-written byte at absolute position `pos`.
-    fn read_at(&self, mut pos: usize) -> u8 {
-        for buffer in self.output.iter() {
-            if pos < buffer.len() {
-                return buffer[pos];
-            }
-            pos -= buffer.len();
-        }
-        unreachable!("read position precedes total_written");
-    }
 }
 
-/// Decode exactly one sequence byte by byte across fragment and buffer edges.
-/// Returns `true` when it was the block's final, literals-only sequence.
+/// Decode exactly one sequence across fragment and buffer edges, copying in
+/// the largest chunks the edges allow. Returns `true` when it was the block's
+/// final, literals-only sequence.
 fn straddling_sequence(
     input: &[&[u8]],
     frag_idx: &mut Option<usize>,
@@ -309,9 +371,14 @@ fn straddling_sequence(
     if literal_length == 15 {
         literal_length += reader.read_extension()?;
     }
-    for _ in 0..literal_length {
-        let byte = reader.read_byte()?;
-        writer.write_byte(byte)?;
+    // Chunked, not byte-wise: an incompressible page is one giant literal-only
+    // sequence, so a page-spanning literal lands here whenever the page
+    // straddles an input fragment edge.
+    let mut remaining = literal_length;
+    while remaining > 0 {
+        let chunk = reader.read_chunk(remaining)?;
+        writer.write_slice(chunk)?;
+        remaining -= chunk.len();
     }
     if reader.exhausted() {
         return Ok(true);
@@ -332,12 +399,7 @@ fn straddling_sequence(
     if offset > writer.total_written() {
         return Err(DecompressError::OffsetOutOfBounds);
     }
-    // Re-derive the source position every iteration: an overlapping match
-    // (offset < match_length) reads bytes this same loop just produced.
-    for _ in 0..match_length {
-        let byte = writer.read_at(writer.total_written() - offset);
-        writer.write_byte(byte)?;
-    }
+    writer.copy_back_reference(offset, match_length)?;
     Ok(false)
 }
 
