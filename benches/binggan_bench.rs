@@ -45,6 +45,58 @@ fn main() {
         .collect();
     block_compress(InputGroup::new_with_inputs(named_data));
     block_decompress();
+    #[cfg(not(feature = "safe-decode"))]
+    block_decompress_scattered();
+}
+
+/// Scattered block decompression against the stock contiguous decode: the 1x1
+/// shape (no scattering) and mid-point input/output splits, all writing into
+/// pre-allocated buffers.
+#[cfg(not(feature = "safe-decode"))]
+fn block_decompress_scattered() {
+    use std::cell::RefCell;
+
+    let mut runner = BenchRunner::with_name("block_decompress_scattered");
+    runner.add_plugin(CacheTrasher::default());
+    for data_uncomp in ALL {
+        let comp = lz4_flex::block::compress(data_uncomp);
+        let len = data_uncomp.len();
+
+        let mut group = runner.new_group();
+        group.set_name(len.to_string());
+        group.set_input_size(len);
+
+        let out = RefCell::new(vec![0u8; len]);
+        group.register_with_input("stock decompress_into", &comp, move |comp| {
+            let mut out = out.borrow_mut();
+            black_box(lz4_flex::block::decompress_into(comp, &mut out).unwrap())
+        });
+
+        let out = RefCell::new(vec![0u8; len]);
+        group.register_with_input("scattered 1x1", &comp, move |comp| {
+            let mut out = out.borrow_mut();
+            let mut output = [&mut out[..]];
+            black_box(lz4_flex::block::decompress_scattered(&[comp], &mut output).unwrap())
+        });
+
+        let out = RefCell::new(vec![0u8; len]);
+        group.register_with_input("input split 2", &comp, move |comp| {
+            let mut out = out.borrow_mut();
+            let mut output = [&mut out[..]];
+            let input = [&comp[..comp.len() / 2], &comp[comp.len() / 2..]];
+            black_box(lz4_flex::block::decompress_scattered(&input, &mut output).unwrap())
+        });
+
+        let out = RefCell::new((vec![0u8; len / 2], vec![0u8; len - len / 2]));
+        group.register_with_input("output split 2", &comp, move |comp| {
+            let mut out = out.borrow_mut();
+            let (a, b) = &mut *out;
+            let mut output = [&mut a[..], &mut b[..]];
+            black_box(lz4_flex::block::decompress_scattered(&[comp], &mut output).unwrap())
+        });
+
+        group.run();
+    }
 }
 
 #[cfg(feature = "frame")]
